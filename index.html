@@ -471,6 +471,7 @@ kbd { background: var(--panel2); border: 1px solid var(--line2); border-radius: 
           </div>
           <span>Hero clip length (seconds) <span class="tip" title="While the hero clip is selected the quick button (L) uses this length. Making a shorter clip the hero lengthens it to this, keeping its start; a longer one is left alone.">ⓘ</span></span>
           <input type="number" min="0.5" max="60" step="0.5" data-s="heroLenSecs">
+          <label class="inline"><input type="checkbox" data-s="heroHideBar"> Zoom hero clip to hide frogbox's score bar <span class="tip" title="Crops the bottom of the hero clip so frogbox's bar and its score don't show on the cover or closing screen. It zooms in about 16%, so anything at the far edge of the picture is cut too.">ⓘ</span></label>
           <label class="inline"><input type="checkbox" data-s="coverFade"> Fade out to black</label>
         </div>
         <div class="field" data-if="hasSponsor">
@@ -516,7 +517,7 @@ kbd { background: var(--panel2); border: 1px solid var(--line2); border-radius: 
             <input type="range" min="2" max="45" step="0.5" data-s="vCaptionLiftPct">
           </div>
           <div class="field" data-if="ticker">
-            <span>Banner height: <b id="tickerPctLbl"></b>% of the frame <span class="tip" title="The banner sits over the bottom of every clip (and the cover) with the club logo; the caption slides out from the logo for each ball. 14% covers frogbox's bar.">ⓘ</span></span>
+            <span>Banner height: <b id="tickerPctLbl"></b>% of the frame <span class="tip" title="The banner sits over the bottom of every clip with the club logo; the caption slides out from the logo for each ball. 14% covers frogbox's bar.">ⓘ</span></span>
             <input type="range" min="8" max="25" step="0.5" data-s="tickerPct">
           </div>
           <div class="field" data-if="tickerSponsor">
@@ -692,7 +693,27 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const ease = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Timers on a hidden page slow to almost nothing, which stalls an export until the browser takes its codecs back
+// ("Codec reclaimed due to inactivity"). A worker's timers aren't slowed, so sleep through one.
+const sleep = (() => {
+  let worker, nextId = 0;
+  const waiting = new Map();
+  const wakeAll = () => { waiting.forEach(r => r()); waiting.clear(); };
+  const start = () => {
+    try {
+      worker = new Worker(URL.createObjectURL(new Blob(['onmessage = e => setTimeout(() => postMessage(e.data.id), e.data.ms)'], { type: 'text/javascript' })));
+      worker.onmessage = e => { const r = waiting.get(e.data); waiting.delete(e.data); if (r) r(); };
+      worker.onerror = () => { worker = null; wakeAll(); };
+    } catch { worker = null; }
+  };
+  return ms => new Promise(res => {
+    if (worker === undefined) start();
+    if (!worker) { setTimeout(res, ms); return; }
+    const id = ++nextId;
+    waiting.set(id, res);
+    worker.postMessage({ id, ms });
+  });
+})();
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtSecs = s => {
   s = Math.max(0, Math.round(s));
@@ -727,7 +748,7 @@ const DEFAULT_SETTINGS = {
   coverSponsorPos: 'panelBottom', coverSponsorSizePct: 10, coverSponsorMarginPct: 4, coverSponsorLabel: 'Proudly supported by',
   sponsorScreenLabel: 'Highlights brought to you by', sponsorScreenSecs: 4,
   title: '', subtitle: '', line3: '', result: '',
-  scorecardsOn: true, scorecardSecs: 8, cardResultOn: true, captionOn: true, captionSecs: 5, captionStyle: 'popup', tickerPct: 14, coverFade: true, cardFade: true,
+  heroHideBar: true, scorecardsOn: true, scorecardSecs: 8, cardResultOn: true, captionOn: true, captionSecs: 5, captionStyle: 'popup', tickerPct: 14, coverFade: true, cardFade: true,
   bitrateMbps: 0, exportAudio: true, soundOn: false, quickLenSecs: 3,
   fontHead: 'Barlow Condensed', fontBody: 'Barlow', textCase: 'asis',
   coverSide: 'left', coverWidthPct: 30,
@@ -745,6 +766,21 @@ function cropRect(fr, sw, sh, aspect) {
   let h = sh / Math.max(1, fr.zoom || 1), w = h * aspect;
   if (w > sw) { w = sw; h = w / aspect; }
   return { x: clamp(fr.x * sw - w / 2, 0, sw - w), y: clamp(fr.y * sh - h / 2, 0, sh - h), w, h };
+}
+// Hero clip: zoom in just enough to crop frogbox's burned-in score bar (its top is ~87.2% down the source). Landscape
+// keeps the edge on the panel's side, which also pushes the action out from behind the panel. Vertical keeps the
+// clip's frame, shrunk and moved up only as far as it needs to clear the bar.
+const HERO_KEEP = 0.865;
+const heroBarHidden = () => S.settings.heroHideBar !== false;
+function heroCrop(clip, sw, sh, aspect) {
+  const keepH = sh * HERO_KEEP;
+  if (aspect < 1) {
+    const r = cropRect(frameOf(clip), sw, sh, aspect);
+    const h = Math.min(r.h, keepH), w = h * aspect;
+    return { x: clamp(r.x + (r.w - w) / 2, 0, sw - w), y: clamp(r.y + (r.h - h) / 2, 0, keepH - h), w, h };
+  }
+  const w = keepH * aspect;
+  return { x: S.settings.coverSide === 'right' ? sw - w : 0, y: 0, w, h: keepH };
 }
 function outputSize(srcW, srcH) {
   if (!isVertical()) {
@@ -1364,8 +1400,7 @@ function sponsorFit(maxW, h) {
 function coverSponsorCorner(sp, W, H, maxW, want, labH) {
   const m = Math.min(W, H) * S.settings.coverSponsorMarginPct / 100;
   const { w, h } = sponsorFit(maxW, want);
-  const bottom = tickerOn() ? tickerBox(W, H, S.hero).y : H;  // keep clear of the ticker banner
-  return { x: sp.align === 'right' ? W - m - w : m, y: sp.top ? m + labH : bottom - m - h, w, h };
+  return { x: sp.align === 'right' ? W - m - w : m, y: sp.top ? m + labH : H - m - h, w, h };
 }
 function drawCoverSponsor(ctx, box, label, labelPx, align, overVideo, u) {
   const st = S.settings, { x, y, w, h } = box;
@@ -1486,7 +1521,7 @@ function drawCaptionVertical(ctx, W, H, ball, a) {
 
 function drawClipOverlay(ctx, W, H, clip, t) {
   drawSponsorCorner(ctx, W, H, clip);
-  if (tickerOn()) drawTicker(ctx, W, H, clip, t, true);
+  if (tickerOn()) drawTicker(ctx, W, H, clip, t);
   else drawCaption(ctx, W, H, clip, t);
 }
 
@@ -1504,10 +1539,10 @@ function tickerBox(W, H, clip) {
   const y = Math.min(top, H - 200 * W / 1080);
   return { y, h: H - y };
 }
-function drawTicker(ctx, W, H, clip, t, withCaption) {
+function drawTicker(ctx, W, H, clip, t) {
   const st = S.settings, vert = H > W, u = Math.min(W, H) / 1080;
   const { y: y0, h: bh } = tickerBox(W, H, clip);
-  const ball = withCaption && st.captionOn ? ballOf(clip) : null;
+  const ball = st.captionOn ? ballOf(clip) : null;
   const D = st.captionSecs, T = 0.5;
   const capA = ball && t >= 0 && t <= D ? ease(t / T) * (t > D - T ? ease((D - t) / T) : 1) : 0;
   const rule = 6 * u, iy = y0 + rule, ih = bh - rule, pad = (vert ? 40 : 48) * u;
@@ -1522,8 +1557,6 @@ function drawTicker(ctx, W, H, clip, t, withCaption) {
   }
   ctx.fillStyle = st.secondary;
   ctx.fillRect(0, y0, W, rule);
-  // On the cover the band just hides frogbox's bar: the panel already has the logo and match name.
-  if (!withCaption) { ctx.restore(); return; }
 
   // logo, then a thin divider the caption slides out from behind
   let divX = pad - 28 * u;
@@ -1779,7 +1812,6 @@ function coverBlockV(ctx, ct, cx, y0, maxW, k, u, draw) {
 function drawCoverVertical(ctx, W, H, t, D) {
   const st = S.settings, u = W / 1080, ct = coverText(), a = ease(t / 0.8);
   const atTop = st.vCoverPos !== 'bottom';
-  if (tickerOn()) drawTicker(ctx, W, H, S.hero, t, false);
   const pad = 80 * u, cx = W / 2, maxW = W - pad * 2, rule = 6 * u;
   // A top panel keeps clear of the app UI that social platforms draw over the top ~7% of the frame.
   const topPad = atTop ? Math.max(70 * u, H * 0.07) : 64 * u, botPad = 64 * u;
@@ -1842,7 +1874,6 @@ function drawCover(ctx, W, H, t, D) {
   const st = S.settings, u = H / 1080, ct = coverText();
   const right = st.coverSide === 'right';
   const a = ease(t / 0.8);
-  if (tickerOn()) drawTicker(ctx, W, H, S.hero, t, false);  // under the panel, like part of the video
   const pw = W * clamp(st.coverWidthPct, 15, 60) / 100, slant = pw * 0.14, stripe = W * 0.012;
   const X = x => right ? W - x : x;  // mirror shapes for a right-hand panel
   ctx.save();
@@ -1909,7 +1940,8 @@ function battingRows(c) {
   return { batted, dnb: bat.filter(b => !batted.includes(b)) };
 }
 function bowlingRows(c) {
-  const bowl = (c.bowling || []).slice().sort((a, b) => (a.bowlOrder ?? 99) - (b.bowlOrder ?? 99));
+  // A bowler on 0 overs is usually a data error, so they don't get a row
+  const bowl = (c.bowling || []).filter(b => +b.oversBowled > 0).sort((a, b) => (a.bowlOrder ?? 99) - (b.bowlOrder ?? 99));
   const fow = (c.fallOfWickets || []).slice().sort((a, b) => a.order - b.order);
   return { bowl, fow };
 }
@@ -2409,6 +2441,14 @@ function redrawOverlay() {
   const W = ov.width, H = ov.height;
   octx.clearRect(0, 0, W, H);
   ov.style.cursor = isVertical() && P.mode === 'clip' && currentClip() ? 'grab' : '';
+  // Landscape preview of the hero zoom. Vertical shows it through the crop box instead.
+  const heroOnStage = (P.mode === 'clip' && S.sel?.kind === 'hero') || (P.mode === 'card' && P.cardOverHero);
+  let vt = '';
+  if (heroOnStage && heroBarHidden() && !isVertical()) {
+    const r = heroCrop(S.hero, W, H, W / H);
+    vt = `scale(${W / r.w}) translate(${-r.x / W * 100}%, 0)`;
+  }
+  if (video.style.transform !== vt) { video.style.transformOrigin = '0 0'; video.style.transform = vt; }
   // Overlays are laid out for the output size, then scaled into the preview area.
   const [OW, OH] = isVertical() ? [1080, 1920] : [W, H];
   if (P.mode === 'card' && P.card) {
@@ -2432,7 +2472,7 @@ function redrawOverlay() {
   // seen changing; while playing they animate exactly as in the export.
   const showT = video.paused ? Math.max(rel, S.sel.kind === 'hero' ? 0.8 : 0.5) : rel;
   if (isVertical()) {
-    const r = cropRect(frameOf(c), W, H, 9 / 16);
+    const r = S.sel?.kind === 'hero' && heroBarHidden() ? heroCrop(c, W, H, 9 / 16) : cropRect(frameOf(c), W, H, 9 / 16);
     octx.fillStyle = inClip ? 'rgba(0,0,0,.62)' : 'rgba(0,0,0,.75)';
     octx.beginPath();
     octx.rect(0, 0, W, H);
@@ -2736,6 +2776,7 @@ function previewScreen(draw) {
   video.pause();
   P.mode = 'card';
   P.card = draw;
+  P.cardOverHero = false;
   $('#stageMsg').textContent = '';
 }
 
@@ -2881,6 +2922,7 @@ function previewClosing() {
   const over = closingOverHero();
   if (over) loadWindowFor(S.hero, S.hero.startMs);
   previewScreen((ctx, W, H) => drawClosing(ctx, W, H, 99, 0, over));
+  P.cardOverHero = over;
 }
 // The result goes on the reel's last scorecard (or the match's last innings when previewing one not in the reel).
 function cardResult(inn) {
@@ -3463,8 +3505,9 @@ class ReelRenderer {
     }
   }
 
-  async renderClip(clip, overlay, label, { audioFadeSecs = 0 } = {}) {
+  async renderClip(clip, overlay, label, { audioFadeSecs = 0, hero = false } = {}) {
     const durUs = clip.durMs * 1000, base = this.cursorUs, W = this.W, H = this.H, ctx = this.ctx;
+    const heroZoom = hero && heroBarHidden();
     const crop = this.vertical ? frameOf(clip) : null;
     const segs = this.segsFor(clip);
     if (!segs.length) throw new Error(`No video for ${label}.`);
@@ -3474,8 +3517,8 @@ class ReelRenderer {
         try {
           const rel = f.timestamp;
           if (rel >= 0 && rel < durUs && rel > lastRel && !this.err) {
-            if (crop) {
-              const r = cropRect(crop, f.displayWidth, f.displayHeight, W / H);
+            if (crop || heroZoom) {
+              const r = heroZoom ? heroCrop(clip, f.displayWidth, f.displayHeight, W / H) : cropRect(crop, f.displayWidth, f.displayHeight, W / H);
               ctx.drawImage(f, r.x, r.y, r.w, r.h, 0, 0, W, H);
             } else ctx.drawImage(f, 0, 0, W, H);
             overlay(ctx, W, H, rel / 1e6);
@@ -3649,6 +3692,9 @@ async function exportReel({ toBuffer = false, onLog = null, writableForTest = nu
   const R = new ReelRenderer(log, progress);
   activeRender = R;
   $('#exportBtn').disabled = true;
+  // Browsers won't freeze a background page that's holding a lock (where locks are available).
+  let releaseLock = null;
+  navigator.locks?.request('highlights-export', { ifAvailable: true }, lock => lock && new Promise(r => { releaseLock = r; })).catch(() => {});
   try {
     await loadFonts();
     const firstClip = seq.find(s => s.clip)?.clip;
@@ -3662,7 +3708,7 @@ async function exportReel({ toBuffer = false, onLog = null, writableForTest = nu
       R.prefetch(seq.slice(n).find(x => x.clip)?.clip, 2);
       if (s.kind === 'cover') {
         log(`${n}/${seq.length} Cover`);
-        await R.renderClip(s.clip, (ctx, W, H, t) => drawCover(ctx, W, H, t, s.secs), 'the cover');
+        await R.renderClip(s.clip, (ctx, W, H, t) => drawCover(ctx, W, H, t, s.secs), 'the cover', { hero: true });
       } else if (s.kind === 'clip') {
         const b = ballOf(s.clip);
         log(`${n}/${seq.length} ${b ? `${b.over}.${b.ballNo} ${b.desc}` : 'Clip'}`);
@@ -3673,7 +3719,7 @@ async function exportReel({ toBuffer = false, onLog = null, writableForTest = nu
         await R.renderCard((ctx, W, H, t) => drawSponsorScreen(ctx, W, H, t), s.secs);
       } else if (s.kind === 'closing') {
         log(`${n}/${seq.length} Closing screen`);
-        if (s.clip) await R.renderClip(s.clip, (ctx, W, H, t) => drawClosing(ctx, W, H, t, s.secs, true), 'the closing screen', { audioFadeSecs: 0.8 });
+        if (s.clip) await R.renderClip(s.clip, (ctx, W, H, t) => drawClosing(ctx, W, H, t, s.secs, true), 'the closing screen', { audioFadeSecs: 0.8, hero: true });
         else await R.renderCard((ctx, W, H, t) => drawClosing(ctx, W, H, t, s.secs, false), s.secs);
       } else {
         log(`${n}/${seq.length} Scorecard · ${inningsLabel(s.innings)} ${teamName(s.innings.battingTeamId)}`);
@@ -3703,10 +3749,11 @@ async function exportReel({ toBuffer = false, onLog = null, writableForTest = nu
     R.close();
     if (writable) { try { await writable.abort(); } catch {} }
     pctEl.textContent = e instanceof Cancelled ? 'Cancelled' : 'Export failed';
-    log(e.message || String(e), true);
+    log(/reclaimed/i.test(e.message || '') ? 'The browser stopped this export while it was in the background (it may have put the tab or the computer to sleep). Export again.' : e.message || String(e), true);
     if (!(e instanceof Cancelled)) console.error(e);
     throw e;
   } finally {
+    releaseLock?.();
     activeRender = null;
     renderPlaylist();
   }
